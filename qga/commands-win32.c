@@ -27,6 +27,7 @@
 #include <lm.h>
 #include <wtsapi32.h>
 #include <wininet.h>
+#include <tlhelp32.h>
 
 #include "guest-agent-core.h"
 #include "vss-win32.h"
@@ -2521,4 +2522,77 @@ GuestCpuStatsList *qmp_guest_get_cpustats(Error **errp)
 {
     error_setg(errp, QERR_UNSUPPORTED);
     return NULL;
+}
+
+static int kill_process(uint32_t pid)
+{
+    HANDLE process;
+    int res;
+
+    process = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (process == INVALID_HANDLE_VALUE) {
+        res = GetLastError();
+        if (res != ERROR_FILE_NOT_FOUND) {
+            return 0;
+        }
+        return res;
+    }
+
+    TerminateProcess(process, 255);
+    CloseHandle(process);
+
+    return 0;
+}
+
+static int kill_process_tree_do(HANDLE snapshot, uint32_t current_pid)
+{
+    PROCESSENTRY32 entry;
+    uint32_t pid, parent_pid;
+    int res = 0, children_res = 0;
+
+    entry.dwSize = sizeof(PROCESSENTRY32);
+
+    if (!Process32First(snapshot, &entry)) {
+        return 0;
+    }
+
+    do {
+        pid = entry.th32ProcessID;
+        parent_pid = entry.th32ParentProcessID;
+        if (pid == current_pid) {
+            res = kill_process(pid);
+            g_debug("killing pid=%u ppid=%u name=%s res=%d",
+                    (guint)entry.th32ProcessID,
+                    (guint)entry.th32ParentProcessID,
+                    entry.szExeFile, res);
+            printf("killing pid=%u ppid=%u name=%s res=%d",
+                    (guint)entry.th32ProcessID,
+                    (guint)entry.th32ParentProcessID,
+                    entry.szExeFile, res);
+        } else if (parent_pid == current_pid) {
+            children_res = kill_process_tree_do(snapshot, pid);
+        }
+    } while (Process32Next(snapshot, &entry));
+
+    if (res != 0) {
+        return res;
+    }
+    return children_res;
+}
+
+int kill_process_tree(uint32_t pid)
+{
+    HANDLE snapshot;
+    int res;
+
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return GetLastError();
+    }
+
+    res = kill_process_tree_do(snapshot, pid);
+
+    CloseHandle(snapshot);
+
+    return res;
 }
